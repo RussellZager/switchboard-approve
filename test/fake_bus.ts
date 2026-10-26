@@ -25,7 +25,7 @@ const PREFIX = "/functions/v1/switchboard";
 
 // ---------------- state ----------------
 interface Invite { name: string; expires: number; used: boolean }
-interface Challenge { purpose: "register" | "device" | "list" | "decide"; bound: string; expires: number; used: boolean }
+interface Challenge { purpose: "register" | "device" | "list" | "decide" | "enroll_list" | "enroll_decide"; bound: string; expires: number; used: boolean }
 interface Passkey { id: string; publicKey: Uint8Array; name: string; alg: string }
 interface Device { status: "pending" | "approved" | "denied"; expires: number }
 interface Approval {
@@ -34,6 +34,13 @@ interface Approval {
   decided?: string;
 }
 interface Log { route: string; status: number; code?: string; body?: unknown }
+// An enrollment row as the bus keeps it. `code` and `wrong` never leave the fake bus.
+interface Enrollment {
+  enrollment_id: string; requested_id: string; kind: string; platform: string; display_name: string;
+  created_at: string; expires_at: string; replace: boolean; requested_by: string | null;
+  reply_token: boolean; lookalike_of: string[];
+  code: string; wrong: number; status: "pending" | "approved" | "denied";
+}
 
 let invites = new Map<string, Invite>();
 let challenges = new Map<string, Challenge>();
@@ -41,13 +48,24 @@ let passkeys = new Map<string, Passkey>();
 let devices = new Map<string, Device>();
 let approvals = new Map<string, Approval>();
 let decisions: { request_id: string; decision: string }[] = [];
+let enrollments = new Map<string, Enrollment>();
+let enrollRequests: Record<string, unknown>[] = []; // decide bodies minus the assertion
+let enrollFailNext: string | null = null;
 let log: Log[] = [];
 let failNext: string | null = null;
 
 function reset() {
   invites = new Map(); challenges = new Map(); passkeys = new Map(); devices = new Map();
   approvals = new Map(); decisions = []; log = []; failNext = null;
+  enrollments = new Map(); enrollRequests = []; enrollFailNext = null;
 }
+const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+function enrollmentId(): string {
+  const b = crypto.getRandomValues(new Uint8Array(26));
+  return "enr_" + [...b].map((x) => CROCKFORD[x % 32]).join("");
+}
+const ENR_ID = /^enr_[0-9A-HJKMNP-TV-Z]{26}$/;
+const ENROLL_DECIDE_KEYS = new Set(["enrollment_id", "decision", "code", "replace", "assertion"]);
 
 function rand(n = 32): string {
   const b = crypto.getRandomValues(new Uint8Array(n));
@@ -67,6 +85,7 @@ const normCode = (c: unknown) => String(c ?? "").toUpperCase().replace(/[-\s]/g,
 const CORS_ROUTES = new Set([
   "/v1/passkeys/register/options", "/v1/passkeys/register/verify", "/v1/passkeys/auth/options",
   "/v1/owner/device/approve", "/v1/owner/device/deny", "/v1/approvals/web/list", "/v1/approvals/web/decide",
+  "/v1/enrollments/web/list", "/v1/enrollments/web/decide",
 ]);
 
 function json(status: number, body: unknown, cors: boolean): Response {
@@ -79,9 +98,11 @@ function json(status: number, body: unknown, cors: boolean): Response {
   return new Response(JSON.stringify(body), { status, headers: h });
 }
 class HttpError extends Error {
-  constructor(public status: number, public code: string, msg: string) { super(msg); }
+  constructor(public status: number, public code: string, msg: string, public extra: Record<string, unknown> = {}) { super(msg); }
 }
-const fail = (status: number, code: string, msg: string): never => { throw new HttpError(status, code, msg); };
+const fail = (status: number, code: string, msg: string, extra: Record<string, unknown> = {}): never => {
+  throw new HttpError(status, code, msg, extra);
+};
 
 function b64urlDecode(s: string): Uint8Array {
   const pad = s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4);
@@ -195,7 +216,14 @@ async function route(path: string, b: Body): Promise<[number, unknown]> {
         if (b.decision !== "approve" && b.decision !== "deny") fail(422, "validation_failed", "decision must be approve or deny.");
         return [200, await newAuthOptions("decide", `${b.request_id}|${b.decision}`)];
       }
-      return fail(422, "validation_failed", "purpose must be device, list, or decide.");
+      if (b.purpose === "enroll_list") return [200, await newAuthOptions("enroll_list", "")];
+      if (b.purpose === "enroll_decide") {
+        // Options never look the enrollment up (SPEC), so they tell nothing about it.
+        if (typeof b.enrollment_id !== "string" || !ENR_ID.test(b.enrollment_id)) fail(422, "validation_failed", "enrollment_id is required.");
+        if (b.decision !== "approve" && b.decision !== "deny") fail(422, "validation_failed", "decision must be approve or deny.");
+        return [200, await newAuthOptions("enroll_decide", `${b.enrollment_id}|${b.decision}`)];
+      }
+      return fail(422, "validation_failed", "purpose must be device, list, decide, enroll_list, or enroll_decide.");
     }
     case "/v1/owner/device/approve":
     case "/v1/owner/device/deny": {
@@ -226,6 +254,42 @@ async function route(path: string, b: Body): Promise<[number, unknown]> {
       a!.decided = b.decision;
       decisions.push({ request_id: b.request_id, decision: b.decision });
       return [201, { id: `msg_${rand(8)}`, created_at: new Date().toISOString(), request_id: b.request_id, decision: b.decision }];
+    }
+    case "/v1/enrollments/web/list": {
+      if (!b.assertion || typeof b.assertion !== "object") fail(401, "bad_assertion", "assertion is required.");
+      await verifyAssertion(b.assertion, "enroll_list", "");
+      const now = Date.now();
+      const live = [...enrollments.values()].filter((e) => e.status === "pending" && Date.parse(e.expires_at) > now)
+        .sort((x, y) => x.created_at.localeCompare(y.created_at))
+        .map(({ code: _c, wrong, status: _s, ...e }) => ({ ...e, code_tries_left: 3 - wrong }));
+      return [200, { owner_id: "rz", acts_as: "rz-operator", enrollments: live }];
+    }
+    case "/v1/enrollments/web/decide": {
+      // Checks in SPEC order; the first failure wins.
+      if (!b.assertion || typeof b.assertion !== "object") fail(401, "bad_assertion", "assertion is required.");
+      const { assertion: _a, ...seen } = b;
+      enrollRequests.push(seen);
+      for (const k of Object.keys(b)) if (!ENROLL_DECIDE_KEYS.has(k)) fail(422, "validation_failed", `unknown field ${k}.`);
+      if (typeof b.enrollment_id !== "string" || !ENR_ID.test(b.enrollment_id)) fail(422, "validation_failed", "enrollment_id is invalid.");
+      if (b.decision !== "approve" && b.decision !== "deny") fail(422, "validation_failed", "decision must be approve or deny.");
+      if (b.replace !== undefined && typeof b.replace !== "boolean") fail(422, "validation_failed", "replace must be a boolean.");
+      const digits = String(b.code ?? "").replace(/\D/g, "");
+      if (b.decision === "approve" && (typeof b.code !== "string" || !/^(\d{4}|\d{6})$/.test(digits))) {
+        fail(422, "validation_failed", "code must be 4 or 6 digits.");
+      }
+      await verifyAssertion(b.assertion, "enroll_decide", `${b.enrollment_id}|${b.decision}`);
+      const e = enrollments.get(b.enrollment_id);
+      if (!e || e.status !== "pending" || Date.parse(e.expires_at) <= Date.now()) fail(404, "not_found", "No live pending enrollment.");
+      if (b.decision === "deny") { e!.status = "denied"; return [200, { status: "denied", enrollment_id: e!.enrollment_id }]; }
+      if (digits !== e!.code) {
+        e!.wrong++;
+        if (e!.wrong >= 3) e!.status = "denied";
+        fail(409, "code_mismatch", "Wrong code.", { tries_left: 3 - e!.wrong });
+      }
+      if (enrollFailNext) { const code = enrollFailNext; enrollFailNext = null; fail(409, code, `Injected ${code}.`); }
+      if ((b.replace ?? false) !== e!.replace) fail(409, "replace_mismatch", "replace does not match the row.");
+      e!.status = "approved";
+      return [200, { status: "approved", agent_id: e!.requested_id, kind: e!.kind, replaced: e!.replace, reply_token: e!.reply_token }];
     }
   }
   return fail(404, "not_found", "Not found.");
@@ -258,11 +322,35 @@ function control(path: string, b: Body): unknown {
       });
       return { request_id: id };
     }
+    case "/__test/enrollment": {
+      const id = enrollmentId();
+      const now = Date.now();
+      enrollments.set(id, {
+        enrollment_id: id, requested_id: b.requested_id ?? "muse", kind: b.kind ?? "agent",
+        platform: b.platform ?? "meta-muse", display_name: b.display_name ?? "Muse",
+        created_at: b.created_at ?? new Date(now).toISOString(),
+        expires_at: new Date(now + (b.ttl_ms ?? 600_000)).toISOString(),
+        replace: b.replace ?? false, requested_by: "requested_by" in b ? b.requested_by : "rz-operator.s1",
+        reply_token: b.reply_token ?? false, lookalike_of: b.lookalike_of ?? [],
+        code: b.code ?? "4829", wrong: 0, status: "pending",
+      });
+      return { enrollment_id: id };
+    }
+    case "/__test/enrollment_status": {
+      // Decide a row behind the page's back (e.g. approved from the CLI meanwhile).
+      const e = enrollments.get(b.enrollment_id);
+      if (e) e.status = b.status ?? "approved";
+      return { ok: !!e };
+    }
+    case "/__test/enroll_fail_next":
+      enrollFailNext = String(b.code ?? "id_contested");
+      return { ok: true };
     case "/__test/fail_next":
       failNext = String(b.code ?? "bad_assertion");
       return { ok: true };
     case "/__test/state":
       return {
+        enrollments: Object.fromEntries([...enrollments].map(([k, v]) => [k, v.status])), enroll_requests: enrollRequests,
         passkeys: passkeys.size, decisions,
         devices: Object.fromEntries([...devices].map(([k, v]) => [k, v.status])), log,
       };
@@ -313,7 +401,7 @@ async function busHandler(req: Request): Promise<Response> {
   } catch (e) {
     if (e instanceof HttpError) {
       log.push({ route: path, status: e.status, code: e.code, body: path === "/v1/passkeys/auth/options" ? body : undefined });
-      return json(e.status, { error: e.message, code: e.code }, cors);
+      return json(e.status, { error: e.message, code: e.code, ...e.extra }, cors);
     }
     console.error(e);
     return json(500, { error: "Internal error.", code: "internal" }, cors);

@@ -119,6 +119,74 @@ arm "Have a code? needs exact upper-case input" "Have a code" \
   'const norm = normCode(input.value);' \
   'const norm = input.value.replace("-", "");'
 
+arm "enroll: lookalike confirm skipped" "lookalike needs the extra confirm" \
+  '(!lookalikes.length || confirmBox.checked)' \
+  'true'
+
+arm "enroll: replace warning missing" "replace warning shows" \
+  'h("p", { class: "alert" }, `This replaces the existing agent ${id}; its old key stops working.`)' \
+  'null'
+
+arm "enroll: tries_left ignored" "wrong codes count down" \
+  '`Wrong code. ${n} ${n === 1 ? "try" : "tries"} left.`' \
+  '"Wrong code."'
+
+arm "enroll: third wrong code not final" "wrong codes count down" \
+  'if (left === 0) { finish("Denied", "Denied after 3 wrong codes."); return; }' \
+  ''
+
+arm "enroll: field via innerHTML" "enrollment fields render as text only" \
+  'setText(dd, value);' \
+  'dd.innerHTML = value;'
+
+arm "enroll: decision binding dropped" "Deny sends no code" \
+  '{ purpose: "enroll_decide", enrollment_id: row.enrollment_id, decision }' \
+  '{ purpose: "enroll_decide", enrollment_id: row.enrollment_id }'
+
+arm "enroll: code sent raw" "right code \\(spaces stripped\\)" \
+  'snapshot: () => ({ code: codeDigits(codeIn.value),' \
+  'snapshot: () => ({ code: codeIn.value,'
+
+arm "enroll: deny sends the code" "Deny sends no code" \
+  ': { enrollment_id: row.enrollment_id, decision, assertion };' \
+  ': { enrollment_id: row.enrollment_id, decision, code: codeDigits(codeIn.value), assertion };'
+
+arm "enroll: Approve not gated on the code" "lookalike needs the extra confirm" \
+  'CODE_OK.test(codeDigits(codeIn.value)) && ' \
+  ''
+
+arm "enroll: malformed row still offers Approve" "malformed ID offers only Deny" \
+  'const malformed = malformedRow(row);' \
+  'const malformed = false;'
+
+arm "enroll: list does not flag a malformed row" "malformed ID offers only Deny" \
+  'malformedRow(row) ? h("span", { class: "flag" }, "malformed") : null,' \
+  'null,'
+
+arm "enroll: lookalike IDs not monospace" "lookalike IDs are monospace" \
+  'const idSpan = (x) => h("span", { class: "id" }, x);' \
+  'const idSpan = (x) => x;'
+
+arm "enroll: code read after the prompt" "read at the tap" \
+  'code: snap.code, replace, assertion }' \
+  'code: codeDigits(codeIn.value), replace, assertion }'
+
+arm "enroll: confirm read after the prompt" "read at the tap" \
+  '(!lookalikes.length || snap.confirmed)' \
+  '(!lookalikes.length || confirmBox.checked)'
+
+arm "enroll: inputs editable while busy" "read at the tap" \
+  'onBusy: (on) => { codeIn.disabled = on; confirmBox.disabled = on || finished; },' \
+  'onBusy: () => {},'
+
+arm "enroll: result lost after the view is gone" "after the view is gone" \
+  'if (!el.isConnected) app.append(h("p", { class: result.className, role: "status" }, idSpan(id), `: ${message}`));' \
+  ''
+
+arm "enroll: wrong code keeps the old challenge" "wrong codes count down" \
+  'if (canRetry) t.load(); // a new challenge for the Retry tap' \
+  'if (canRetry && errs.retryEl.hidden === false) t.load();'
+
 fi
 
 echo "mutation arms failed to go red: $fails"

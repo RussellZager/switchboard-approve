@@ -1,15 +1,16 @@
 # switchboard-approve
 
-The static page at `https://approve.russellzager.com` for [Switchboard](../cutout) passkeys (the bus repo folder keeps its old name until the folder rename).
-It does three things, chosen by the URL fragment:
+The static page at `https://approve.russellzager.com` for [Switchboard](../bus) passkeys.
+It does four things, chosen by the URL fragment:
 
 | URL | What the owner sees |
 |---|---|
 | `#register=<token>` (from `switchboard passkey add`) | **Add passkey** → "Passkey added. You can close this page." |
 | `#code=WDJB-MJHT` (from `switchboard login`) | The code, **Confirm** / **Not me** → "Signed in on your Mac." |
-| no fragment | **Show requests** → one line per pending agent request; tap for full text; **Approve** / **Deny** |
+| no fragment | **Show requests** → one line per pending agent request; tap for full text; **Approve** / **Deny**. **Show enrollments** → one line per pending agent enrollment; tap for the same view as `#enroll=` |
+| `#enroll=enr_…` (an agent asking to join) | **Show request** → the agent's ID, kind, platform, name, who asked (or "the full window"), expiry and code tries left; a warning when the ID looks like another agent's (Approve needs an extra check) or replaces one; type the code the agent shows → **Approve** / **Deny**. The page never receives the code. The code and the extra check are read at the tap, and both inputs lock while the passkey prompt runs. A row whose ID (or a similar-ID entry) is not lower-case words joined by `-` says "This request looks malformed. Deny it." and offers only **Deny**. A result that arrives after the view was replaced still shows on the page. |
 
-Every action asks for the passkey again (Face ID / Touch ID). Each bus challenge is single use and bound to that one action: the invite, the login code, the list, or one `request_id` + decision. The page stores nothing: no cookies, no localStorage, no session.
+Every action asks for the passkey again (Face ID / Touch ID). Each bus challenge is single use and bound to that one action: the invite, the login code, the list, one `request_id` + decision, the enrollment list, or one `enrollment_id` + decision. The page stores nothing: no cookies, no localStorage, no session.
 
 The browser API it calls is the Switchboard SPEC (v1.12+) section "Passkeys and phone approvals"; the bus is the WebAuthn verifier.
 
@@ -35,7 +36,7 @@ The browser API it calls is the Switchboard SPEC (v1.12+) section "Passkeys and 
 
 ## Passkey prompts and Safari
 
-Safari can refuse `navigator.credentials.*` when an awaited fetch runs between the tap and the call. So the page fetches each challenge **before** the tap: register and device-code options on load, list options on load (and again after each list), and both decide options when a row is expanded. A tap starts the passkey prompt synchronously. Buttons stay disabled until their options arrive.
+Safari can refuse `navigator.credentials.*` when an awaited fetch runs between the tap and the call. So the page fetches each challenge **before** the tap: register and device-code options on load, list options on load (and again after each list), and both decide options when a row is expanded. Enrollments work the same way: `enroll_list` options on load, and both `enroll_decide` options when a row opens. A wrong enrollment code uses up its challenge, so the page fetches a new one before Approve works again. A tap starts the passkey prompt synchronously. Buttons stay disabled until their options arrive.
 
 - Challenges live 300 s. A prefetched challenge older than 240 s is not used: the page fetches a new one and shows "That took too long. Try again." with Retry. `bad_challenge` from the bus does the same.
 - Every Retry after a failed prompt or a failed check uses a new challenge. The page never retries on its own.
@@ -70,14 +71,14 @@ Needs `deno` and `bun`. Playwright uses its own Chromium (`bunx playwright insta
 ```sh
 bun install
 bunx playwright test            # phone viewport: every test; desktop viewport: screenshot tests
-test/mutation.sh                # breaks escaping, bindings, frame guard, final errors, tap-to-prompt, stale/reused challenges, Retry, (shortened), warning, code box; each named test must go red
+test/mutation.sh                # breaks escaping, bindings, frame guard, final errors, tap-to-prompt, stale/reused challenges, Retry, (shortened), warning, code box, and the enrollment view (lookalike confirm, replace warning, tries left, third wrong code, text-only fields, binding, digits-only code, Deny without code, code gate, fresh challenge after a wrong code, malformed ID, monospace lookalike IDs, code and confirm read at the tap, inputs locked while busy, result kept after the view is gone); each named test must go red
 SHOTS_DIR=/tmp/shots bunx playwright test   # where screenshots go (default test-results/shots)
 PAGE_PORT=18865 BUS_PORT=18866 bunx playwright test   # fake target on other ports (gnubby-ssh can hold 18765)
 ```
 
 - `test/fake_bus.ts` implements the browser routes of the bus with real WebAuthn verification (`@simplewebauthn/server`), the contract's CORS rules, and single-use bound challenges. It also serves the page on a second port, so page and bus are cross-origin. RP ID is `localhost`.
 - The fake page server rewrites the CSP `connect-src` to the fake bus. `?csp=raw` serves the file as shipped; one test uses it to prove the browser enforces the CSP.
-- `test/e2e.pw.ts` drives the page with Chrome's CDP virtual authenticator (CTAP2, internal, resident key, user verification). It covers register, login Confirm / Not me, list + approve + deny, expired code, cancelled passkey, network failure, an XSS probe, CSP, no dark mode, the localhost-only override, the manual base64url fallback, frame refusal, prompts inside the tap, stale and bad challenges, bad_assertion Retry, register Retry with new options, the "Have a code?" box, and the "(shortened)" marker. `/__test/fail_next` makes the next assertion check fail with a chosen code.
+- `test/e2e.pw.ts` drives the page with Chrome's CDP virtual authenticator (CTAP2, internal, resident key, user verification). It covers register, login Confirm / Not me, list + approve + deny, expired code, cancelled passkey, network failure, an XSS probe, CSP, no dark mode, the localhost-only override, the manual base64url fallback, frame refusal, prompts inside the tap, stale and bad challenges, bad_assertion Retry, register Retry with new options, the "Have a code?" box, the "(shortened)" marker, and enrollments (`#enroll=` and the root list: lookalike confirm, wrong codes down to denied, replace, Deny, gone rows, id_contested, already_registered, an XSS probe, a malformed ID, bidi isolation and monospace IDs, code and confirm read at the tap, a result after the view is gone). `/__test/fail_next` makes the next assertion check fail with a chosen code. `/__test/enrollment` seeds a pending enrollment (its code stays in the fake bus), `/__test/enrollment_status` decides one behind the page's back, and `/__test/enroll_fail_next` makes the next correct-code approve fail with a chosen 409 code.
 
 ### Real local bus
 
@@ -87,7 +88,7 @@ MUT_TARGET=real test/mutation.sh             # real-bus mutation arms; each must
 SWITCHBOARD_REPO=/path/to/bus E2E_TARGET=real bunx playwright test   # default: the usual bus checkout (CUTOUT_REPO still read)
 ```
 
-- `test/real_setup.ts` (globalSetup) starts `python3 tests/run_local_bus.py --passkeys-origin http://localhost:18765 --port 18766` in `SWITCHBOARD_REPO`, then serves the page on **exactly `http://localhost:18765`** (the bus CORS and passkey origin are exact-match). Ports 18765 and 18766 must be free. Teardown sends SIGTERM only. Bus stderr goes to `test-results/real-bus.stderr.log`.
+- `test/real_setup.ts` (globalSetup) starts `python3 tests/run_local_bus.py --passkeys-origin http://localhost:18765 --port 18766` in `SWITCHBOARD_REPO`, then serves the page on **exactly `http://localhost:18765`** (the bus CORS and passkey origin are exact-match). Ports 18765 and 18766 must be free; override them with `REAL_PAGE_PORT` and `REAL_BUS_PORT` (e.g. `REAL_PAGE_PORT=28765 REAL_BUS_PORT=28766 E2E_TARGET=real bunx playwright test`). Teardown sends SIGTERM only. Bus stderr goes to `test-results/real-bus.stderr.log`.
 - `test/real.pw.ts` seeds only through the bus API (TypeScript ports of the invite / device / poll / ask / thread recipes), never through test-only routes. It checks that the CLI poll gets the token after Confirm and `access_denied` after Not me, and that the requester's thread shows each approve / deny with `verified_sender_role: operator`, and that a second decision gets "Already decided".
 - `test/serve_page.ts` is the shared page server (CSP `connect-src` rewrite, `?csp=raw`), used by both targets.
 - GitHub Pages also publishes `test/`, `package.json` and this README. They hold no secrets.

@@ -479,3 +479,351 @@ test("text cut at the bus cap is marked (shortened)", async ({ page }) => {
   await expect(rowL.locator(".detail .shortened").first()).toHaveText("(shortened)");
   await expect(rowS.locator(".detail .shortened")).toHaveCount(0);
 });
+
+
+// ------------------------------------------------------------------ enrollments
+interface EState extends State { enrollments: Record<string, string>; enroll_requests: Record<string, unknown>[] }
+const enrollOpts = (st: State) => st.log.filter((l) => l.route === "/v1/passkeys/auth/options" && l.body?.purpose === "enroll_decide")
+  .map((l) => [l.body?.enrollment_id, l.body?.decision, l.status]);
+
+async function showEnrollment(page: Page, enrollment_id: string) {
+  await page.goto(url(`enroll=${enrollment_id}`));
+  await page.getByRole("button", { name: "Show request" }).click();
+  await expect(page.locator(".enroll-id")).toBeVisible();
+}
+
+test("enroll link: lookalike needs the extra confirm; wrong codes count down to denied @shots", async ({ page }) => {
+  await installGestureSpy(page);
+  await authenticator(page);
+  await registerViaPage(page);
+  const { enrollment_id } = await ctl<{ enrollment_id: string }>("enrollment", {
+    requested_id: "muse", platform: "meta-muse", display_name: "Muse", requested_by: null,
+    lookalike_of: ["muse-1", "muse2"], code: "4829",
+  });
+  await clearGestures(page);
+  await showEnrollment(page, enrollment_id);
+  const main = page.locator("main");
+  await expect(page.locator(".enroll-id")).toHaveText("muse");
+  await expect(main).toContainText("meta-muse");
+  await expect(main).toContainText("Muse");
+  await expect(main).toContainText("the full window");
+  await expect(main).toContainText(/Expires\s*in \d+ min/);
+  await expect(page.getByRole("note")).toContainText("muse looks like muse-1, muse2.");
+  const approve = page.getByRole("button", { name: "Approve", exact: true });
+  const deny = page.getByRole("button", { name: "Deny", exact: true });
+  const code = page.getByLabel("Code the agent shows");
+  const confirm = page.getByLabel("I checked: this is the agent I expect.");
+  await expect(deny).toBeEnabled(); // decide challenges are prefetched
+  await code.fill("1111");
+  await expect(approve).toBeDisabled(); // a similar ID needs the extra confirm first
+  await confirm.check();
+  await expect(approve).toBeEnabled();
+  await shot(page, "enroll-lookalike");
+
+  await approve.click();
+  await expect(page.getByText("Wrong code. 2 tries left.", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Retry" })).toBeHidden(); // fix the code, tap Approve again
+  await expect(code).toHaveValue("");
+  await expect(approve).toBeDisabled(); // until a code is typed again
+  await expect(page.locator(".fields dd").last()).toHaveText("2");
+  await shot(page, "enroll-wrong-code");
+
+  await code.fill("2222");
+  await expect(approve).toBeEnabled(); // a fresh challenge was fetched for this tap
+  await approve.click();
+  await expect(page.getByText("Wrong code. 1 try left.", { exact: true })).toBeVisible();
+  await code.fill("3333");
+  await expect(approve).toBeEnabled();
+  await approve.click();
+  await expect(page.getByRole("status")).toHaveText("Denied after 3 wrong codes.");
+  await expect(approve).toHaveCount(0);
+  await expect(deny).toHaveCount(0);
+  await expect(code).toHaveCount(0);
+  await shot(page, "enroll-denied");
+
+  const st = await ctl<EState>("state");
+  expect(st.enrollments[enrollment_id]).toBe("denied");
+  // One fresh approve challenge per tap (Safari: no fetch between the tap and the prompt).
+  expect(enrollOpts(st)).toEqual([
+    [enrollment_id, "approve", 200], [enrollment_id, "deny", 200],
+    [enrollment_id, "approve", 200], [enrollment_id, "approve", 200],
+  ]);
+  expect(st.log.filter((l) => l.route === "/v1/enrollments/web/decide").map((l) => [l.status, l.code]))
+    .toEqual([[409, "code_mismatch"], [409, "code_mismatch"], [409, "code_mismatch"]]);
+  expect(await gestureReport(page)).toEqual([inTap("get"), inTap("get"), inTap("get"), inTap("get")]);
+});
+
+test("enroll link: right code (spaces stripped) approves; reply-only key stored", async ({ page }) => {
+  await installGestureSpy(page);
+  await authenticator(page);
+  await registerViaPage(page);
+  const { enrollment_id } = await ctl<{ enrollment_id: string }>("enrollment", { requested_id: "scout", reply_token: true, code: "482913" });
+  await clearGestures(page);
+  await showEnrollment(page, enrollment_id);
+  await expect(page.getByRole("note")).toHaveCount(0); // no lookalike, no extra confirm
+  await expect(page.locator("main")).toContainText("rz-operator.s1");
+  const approve = page.getByRole("button", { name: "Approve", exact: true });
+  await page.getByLabel("Code the agent shows").fill("48 291"); // 5 digits
+  await expect(approve).toBeDisabled(); // 4 or 6 digits only
+  await page.getByLabel("Code the agent shows").fill("482 913");
+  await approve.click();
+  await expect(page.getByRole("status")).toHaveText("Approved scout. Reply-only key stored.");
+  const st = await ctl<EState>("state");
+  expect(st.enrollments[enrollment_id]).toBe("approved");
+  expect(st.enroll_requests).toEqual([{ enrollment_id, decision: "approve", code: "482913", replace: false }]);
+  expect(await gestureReport(page)).toEqual([inTap("get"), inTap("get")]);
+});
+
+test("enroll link: replace warning shows, and replace is sent", async ({ page }) => {
+  await authenticator(page);
+  await registerViaPage(page);
+  const { enrollment_id } = await ctl<{ enrollment_id: string }>("enrollment", { requested_id: "muse", replace: true });
+  await showEnrollment(page, enrollment_id);
+  await expect(page.getByText("This replaces the existing agent muse; its old key stops working.", { exact: true })).toBeVisible();
+  await shot(page, "enroll-replace");
+  await page.getByLabel("Code the agent shows").fill("4829");
+  await page.getByRole("button", { name: "Approve", exact: true }).click();
+  await expect(page.getByRole("status")).toHaveText("Approved muse.");
+  expect((await ctl<EState>("state")).enroll_requests).toEqual([{ enrollment_id, decision: "approve", code: "4829", replace: true }]);
+});
+
+test("enroll link: Deny sends no code", async ({ page }) => {
+  await installGestureSpy(page);
+  await authenticator(page);
+  await registerViaPage(page);
+  const { enrollment_id } = await ctl<{ enrollment_id: string }>("enrollment", { lookalike_of: ["muse-1"] });
+  await clearGestures(page);
+  await showEnrollment(page, enrollment_id);
+  await page.getByLabel("Code the agent shows").fill("1234"); // typed, but Deny must not send it
+  await page.getByRole("button", { name: "Deny", exact: true }).click(); // no confirm needed to deny
+  await expect(page.getByRole("status")).toHaveText("Denied.");
+  const st = await ctl<EState>("state");
+  expect(st.enrollments[enrollment_id]).toBe("denied");
+  expect(st.enroll_requests).toEqual([{ enrollment_id, decision: "deny" }]);
+  expect(await gestureReport(page)).toEqual([inTap("get"), inTap("get")]);
+});
+
+test("enroll link: decided elsewhere, or absent, says No longer pending", async ({ page }) => {
+  await authenticator(page);
+  await registerViaPage(page);
+  const { enrollment_id } = await ctl<{ enrollment_id: string }>("enrollment", {});
+  await showEnrollment(page, enrollment_id);
+  await ctl("enrollment_status", { enrollment_id, status: "approved" }); // e.g. approved from the CLI
+  await page.getByLabel("Code the agent shows").fill("4829");
+  await page.getByRole("button", { name: "Approve", exact: true }).click();
+  await expect(page.getByRole("status")).toHaveText("No longer pending.");
+  await expect(page.getByRole("button", { name: "Approve", exact: true })).toHaveCount(0);
+  // A link to a row that is no longer listed.
+  await page.goto(url(`enroll=${enrollment_id}`, "&again=1"));
+  await page.getByRole("button", { name: "Show request" }).click();
+  await expect(page.getByRole("status")).toHaveText("No longer pending.");
+  await expect(page.getByLabel("Code the agent shows")).toHaveCount(0);
+});
+
+test("enroll link: id_contested says deny and enroll again, and keeps Deny", async ({ page }) => {
+  await authenticator(page);
+  await registerViaPage(page);
+  const { enrollment_id } = await ctl<{ enrollment_id: string }>("enrollment", {});
+  await showEnrollment(page, enrollment_id);
+  await ctl("enroll_fail_next", { code: "id_contested" });
+  const approve = page.getByRole("button", { name: "Approve", exact: true });
+  await page.getByLabel("Code the agent shows").fill("4829");
+  await approve.click();
+  await expect(page.getByText("Two requests ask for this ID, and one may not be your agent. Deny, then ask your agent to enroll again.", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Retry" })).toBeHidden();
+  const deny = page.getByRole("button", { name: "Deny", exact: true });
+  await expect(deny).toBeEnabled(); // with a fresh challenge
+  await deny.click();
+  await expect(page.getByRole("status")).toHaveText("Denied.");
+});
+
+test("enroll link: already_registered is final, with plain words", async ({ page }) => {
+  await authenticator(page);
+  await registerViaPage(page);
+  const { enrollment_id } = await ctl<{ enrollment_id: string }>("enrollment", {});
+  await showEnrollment(page, enrollment_id);
+  await ctl("enroll_fail_next", { code: "already_registered" });
+  await page.getByLabel("Code the agent shows").fill("4829");
+  await page.getByRole("button", { name: "Approve", exact: true }).click();
+  await expect(page.getByText("That ID is already taken. Ask the agent to enroll again.", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Retry" })).toBeHidden();
+  await expect(page.getByRole("button", { name: "Approve", exact: true })).toBeHidden();
+  await expect(page.getByRole("button", { name: "Deny", exact: true })).toBeHidden();
+});
+
+test("malformed enroll link is refused before any passkey prompt", async ({ page }) => {
+  await installGestureSpy(page);
+  await page.goto(url("enroll=<b>x</b>"));
+  await expect(page.getByText("That link looks wrong.", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Show request" })).toHaveCount(0);
+  expect(await page.locator("main b").count()).toBe(0);
+  expect(await gestureReport(page)).toEqual([]);
+  expect((await ctl<State>("state")).log.length).toBe(0);
+});
+
+test("root page: Enrollments list next to the requests @shots", async ({ page }) => {
+  await installGestureSpy(page);
+  await authenticator(page);
+  await registerViaPage(page);
+  const old = new Date(Date.now() - 3 * 60_000).toISOString();
+  const a = await ctl<{ enrollment_id: string }>("enrollment", { requested_id: "muse", lookalike_of: ["muse-1"], created_at: old });
+  const b = await ctl<{ enrollment_id: string }>("enrollment", { requested_id: "scout", display_name: "Scout", platform: "cli", replace: true });
+  await clearGestures(page);
+  await page.goto(url());
+  await expect(page.getByRole("heading", { name: "Enrollments" })).toBeVisible();
+  await page.getByRole("button", { name: "Show enrollments" }).click();
+  const rowA = page.locator(`[data-enrollment-id="${a.enrollment_id}"]`);
+  const rowB = page.locator(`[data-enrollment-id="${b.enrollment_id}"]`);
+  await expect(rowA).toContainText("muse");
+  await expect(rowA).toContainText("similar ID");
+  await expect(rowA).toContainText("3m");
+  await expect(rowB).toContainText("Scout · cli");
+  await expect(rowB).toContainText("replaces");
+  await expect(page.locator("[data-enrollment-id] .row").first()).toContainText("muse"); // oldest first
+  await shot(page, "enroll-list");
+  await rowB.locator("button.row").click();
+  await expect(rowB.getByText("This replaces the existing agent scout; its old key stops working.", { exact: true })).toBeVisible();
+  await rowB.getByLabel("Code the agent shows").fill("4829");
+  await rowB.getByRole("button", { name: "Approve", exact: true }).click();
+  await expect(rowB.locator(".badge")).toHaveText("Approved");
+  await expect(rowB.getByRole("status")).toHaveText("Approved scout.");
+  await rowA.locator("button.row").click();
+  await rowA.getByRole("button", { name: "Deny", exact: true }).click();
+  await expect(rowA.locator(".badge")).toHaveText("Denied");
+  await shot(page, "enroll-list-decided");
+  const st = await ctl<EState>("state");
+  expect(st.enrollments).toEqual({ [a.enrollment_id]: "denied", [b.enrollment_id]: "approved" });
+  expect(await gestureReport(page)).toEqual([inTap("get"), inTap("get"), inTap("get")]);
+});
+
+test("XSS probe: enrollment fields render as text only", async ({ page }) => {
+  await authenticator(page);
+  await registerViaPage(page);
+  const { enrollment_id } = await ctl<{ enrollment_id: string }>("enrollment", {
+    requested_id: `<b onmouseover="alert('id')">x</b>`,
+    platform: `<img src=x onerror="window.__xss=1">`,
+    display_name: `<script>window.__xss=2</script>`,
+    requested_by: `<svg onload="window.__xss=3"></svg>`,
+    lookalike_of: [`<iframe src="javascript:window.__xss=4"></iframe>`],
+    replace: true,
+  });
+  await showEnrollment(page, enrollment_id);
+  const main = page.locator("main");
+  await expect(main).toContainText(`<img src=x onerror="window.__xss=1">`);
+  await expect(main).toContainText(`<script>window.__xss=2</script>`);
+  await expect(main).toContainText(`<svg onload="window.__xss=3"></svg>`);
+  await expect(main).toContainText(`<iframe src="javascript:window.__xss=4"></iframe>`);
+  await expect(main).toContainText(`This replaces the existing agent <b onmouseover="alert('id')">x</b>; its old key stops working.`);
+  await page.waitForTimeout(500);
+  const injected = await page.evaluate(() => ({
+    n: document.querySelectorAll("main img, main a, main script, main svg, main b, main iframe").length,
+    xss: (window as unknown as { __xss?: number }).__xss ?? null,
+  }));
+  expect(injected).toEqual({ n: 0, xss: null });
+  expect(dialogs).toEqual([]);
+});
+
+// Holds the next passkey result until window.__release() is called. The prompt itself
+// still runs inside the tap; only the page's view of the result is delayed.
+async function holdNextPrompt(page: Page) {
+  await page.evaluate(() => {
+    const w = window as unknown as { __release?: () => void };
+    const orig = navigator.credentials.get.bind(navigator.credentials);
+    navigator.credentials.get = (o?: CredentialRequestOptions) =>
+      orig(o).then((c) => new Promise<Credential | null>((r) => { w.__release = () => r(c); }));
+  });
+}
+async function releasePrompt(page: Page) {
+  await page.waitForFunction(() => typeof (window as unknown as { __release?: () => void }).__release === "function");
+  await page.evaluate(() => (window as unknown as { __release: () => void }).__release());
+}
+
+test("enroll link: malformed ID offers only Deny", async ({ page }) => {
+  await authenticator(page);
+  await registerViaPage(page);
+  const bad = await ctl<{ enrollment_id: string }>("enrollment", { requested_id: "mu\u202ese", lookalike_of: ["muse-1"] });
+  const badLook = await ctl<{ enrollment_id: string }>("enrollment", { requested_id: "scout", lookalike_of: ["Scout"] });
+  const fine = await ctl<{ enrollment_id: string }>("enrollment", { requested_id: "muse-2", lookalike_of: ["muse-1"] });
+  await showEnrollment(page, bad.enrollment_id);
+  await expect(page.getByText("This request looks malformed. Deny it.", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Approve", exact: true })).toHaveCount(0);
+  await expect(page.getByLabel("Code the agent shows")).toHaveCount(0);
+  await expect(page.getByLabel("I checked: this is the agent I expect.")).toHaveCount(0);
+  await page.getByRole("button", { name: "Deny", exact: true }).click();
+  await expect(page.getByRole("status")).toHaveText("Denied.");
+  // The list flags a bad lookalike_of entry too; a well-formed row is not flagged.
+  await page.goto(url());
+  await page.getByRole("button", { name: "Show enrollments" }).click();
+  const rowL = page.locator(`[data-enrollment-id="${badLook.enrollment_id}"]`);
+  const rowF = page.locator(`[data-enrollment-id="${fine.enrollment_id}"]`);
+  await expect(rowL.locator(".flag", { hasText: "malformed" })).toHaveCount(1);
+  await expect(rowF.locator(".flag", { hasText: "malformed" })).toHaveCount(0);
+  await rowL.locator("button.row").click();
+  await expect(rowL.getByText("This request looks malformed. Deny it.", { exact: true })).toBeVisible();
+  await expect(rowL.getByRole("button", { name: "Approve", exact: true })).toHaveCount(0);
+  await rowF.locator("button.row").click();
+  await expect(rowF.getByRole("button", { name: "Approve", exact: true })).toHaveCount(1);
+  expect((await ctl<EState>("state")).enroll_requests).toEqual([{ enrollment_id: bad.enrollment_id, decision: "deny" }]);
+});
+
+test("enroll: IDs are bidi-isolated and lookalike IDs are monospace", async ({ page }) => {
+  await authenticator(page);
+  await registerViaPage(page);
+  const { enrollment_id } = await ctl<{ enrollment_id: string }>("enrollment", { requested_id: "muse", display_name: "Muse", lookalike_of: ["muse-1", "muse2"] });
+  await showEnrollment(page, enrollment_id);
+  const style = (sel: string) => page.locator(sel).first().evaluate((el) => {
+    const s = getComputedStyle(el);
+    return { bidi: s.unicodeBidi, mono: /monospace/.test(s.fontFamily) };
+  });
+  expect(await style(".enroll-id")).toEqual({ bidi: "isolate", mono: true });
+  expect((await style(".fields dd")).bidi).toBe("isolate");
+  await expect(page.locator(".alert .id")).toHaveText(["muse", "muse-1", "muse2"]);
+  expect(await style(".alert .id")).toEqual({ bidi: "isolate", mono: true });
+  await page.goto(url());
+  await page.getByRole("button", { name: "Show enrollments" }).click();
+  expect((await style("[data-enrollment-id] .from")).bidi).toBe("isolate");
+  expect((await style("[data-enrollment-id] .first")).bidi).toBe("isolate");
+});
+
+test("enroll link: code and confirm are read at the tap; inputs lock while busy", async ({ page }) => {
+  await authenticator(page);
+  await registerViaPage(page);
+  const { enrollment_id } = await ctl<{ enrollment_id: string }>("enrollment", { requested_id: "muse", lookalike_of: ["muse-1"], code: "4829" });
+  await showEnrollment(page, enrollment_id);
+  const code = page.getByLabel("Code the agent shows");
+  const confirm = page.getByLabel("I checked: this is the agent I expect.");
+  await code.fill("4829");
+  await confirm.check();
+  await holdNextPrompt(page);
+  await page.getByRole("button", { name: "Approve", exact: true }).click();
+  await expect(code).toBeDisabled();
+  await expect(confirm).toBeDisabled();
+  // A script (not the owner) edits both while the prompt is open; what was tapped is what is sent.
+  await page.evaluate(() => {
+    const c = document.querySelector<HTMLInputElement>(".code-entry input")!;
+    c.value = "1111"; c.dispatchEvent(new Event("input"));
+    const b = document.querySelector<HTMLInputElement>(".confirm input")!;
+    b.checked = false; b.dispatchEvent(new Event("change"));
+  });
+  await releasePrompt(page);
+  await expect(page.getByRole("status")).toHaveText("Approved muse.");
+  await expect(confirm).toBeDisabled();
+  expect((await ctl<EState>("state")).enroll_requests).toEqual([{ enrollment_id, decision: "approve", code: "4829", replace: false }]);
+});
+
+test("enroll link: a decide that ends after the view is gone still shows its result", async ({ page }) => {
+  await authenticator(page);
+  await registerViaPage(page);
+  const { enrollment_id } = await ctl<{ enrollment_id: string }>("enrollment", { requested_id: "scout", code: "4829" });
+  await showEnrollment(page, enrollment_id);
+  await page.getByLabel("Code the agent shows").fill("4829");
+  await holdNextPrompt(page);
+  await page.getByRole("button", { name: "Approve", exact: true }).click();
+  await page.waitForFunction(() => typeof (window as unknown as { __release?: () => void }).__release === "function");
+  await page.evaluate(() => { location.hash = ""; }); // the root page replaces the view
+  await expect(page.getByRole("button", { name: "Show enrollments" })).toBeVisible();
+  await releasePrompt(page);
+  await expect(page.getByRole("status")).toHaveText("scout: Approved scout.");
+  expect(await page.locator(".result .id").evaluate((el) => getComputedStyle(el).unicodeBidi)).toBe("isolate");
+  expect((await ctl<EState>("state")).enrollments[enrollment_id]).toBe("approved");
+});

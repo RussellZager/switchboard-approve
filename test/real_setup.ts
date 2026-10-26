@@ -10,11 +10,13 @@ import { createWriteStream, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 export const ROOT = join(__dirname, "..");
-export const REAL_PAGE_PORT = 18765; // the bus's PASSKEY_ORIGIN is exactly http://localhost:18765
+// The bus's PASSKEY_ORIGIN is set to exactly http://localhost:<REAL_PAGE_PORT> (default 18765).
+// Override with REAL_PAGE_PORT when another process (e.g. gnubby-ssh) holds 18765.
+export const REAL_PAGE_PORT = Number(process.env.REAL_PAGE_PORT ?? 18765);
 export const REAL_BUS_PORT = Number(process.env.REAL_BUS_PORT ?? 18766);
 export const LB_FILE = join(ROOT, "test-results", "real-bus.json");
-// The bus checkout keeps its old folder name until the folder rename (design §2, U15).
-const BUS_REPO = process.env.SWITCHBOARD_REPO || process.env.CUTOUT_REPO || "/Users/rzager/Code/rz@russellzager.com/switchboard/cutout";
+// The bus checkout folder was renamed cutout -> bus (design §2, U15).
+const BUS_REPO = process.env.SWITCHBOARD_REPO || process.env.CUTOUT_REPO || "/Users/rzager/Code/rz@russellzager.com/switchboard/bus";
 
 function waitForLine(p: ChildProcess, match: (line: string) => boolean, what: string, ms: number): Promise<string> {
   return new Promise((resolve, reject) => {

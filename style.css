@@ -150,5 +150,37 @@ button:focus-visible { outline: 3px solid #1d4ed8; outline-offset: 2px; }
 .code-entry .open { width: auto; }
 .retry:disabled { cursor: progress; }
 
+/* Enrollments: an agent asks to join; the owner types the code the agent shows. */
+.section { margin: 2.5rem 0 0.75rem; font-size: 1.05rem; font-weight: 600; }
+.enroll { padding-top: 0.25rem; }
+.enroll-id {
+  margin: 0 0 0.75rem;
+  font: 600 1.6rem/1.25 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+.alert {
+  margin: 0 0 0.75rem;
+  padding: 0.75rem 0.9rem;
+  border: 2px solid #b45309;
+  border-radius: 0.75rem;
+  background: #fffbeb;
+  color: #78350f;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+.alert p { margin: 0 0 0.5rem; }
+.alert-title { font-weight: 700; }
+.confirm { display: flex; gap: 0.6rem; align-items: flex-start; min-height: 2.75rem; font-weight: 600; cursor: pointer; }
+.confirm input { flex: none; width: 1.4rem; height: 1.4rem; margin: 0.1rem 0 0; }
+.fields { display: grid; grid-template-columns: max-content 1fr; gap: 0.3rem 1rem; margin: 0 0 1.25rem; }
+.fields dt { color: #6b6b6b; font-size: 0.95rem; }
+.fields dd { margin: 0; overflow-wrap: anywhere; }
+/* Agent-supplied IDs and names: keep bidi control characters from reordering the text around them. */
+.enroll-id, .fields dd, .from, .first, .id { unicode-bidi: isolate; }
+.alert .id { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+.flag { font-size: 0.8rem; font-weight: 600; padding: 0.05rem 0.45rem; border-radius: 999px; background: #fef3c7; color: #78350f; white-space: nowrap; }
+.result.no { color: #7f1d1d; }
+.result.gone { color: #3f3f46; }
+
 /* Marker for text the bus cut short. */
 .shortened { color: #6b6b6b; font-style: italic; white-space: nowrap; }
